@@ -28,6 +28,12 @@ from transformers import (
     BitsAndBytesConfig,
 )
 
+from opentelemetry import trace
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.instrumentation.langchain import LangchainInstrumentor
+
 from config import settings
 
 # --- Logging Setup ---
@@ -149,7 +155,7 @@ class IngestionEngine:
 
     async def run(self) -> Tuple[Optional[any], Optional[any]]:
         """Orchestrates loading, chunking, and indexing."""
-        logger.info(f"📡 Polling {len(settings.DOMAINS)} RSS feeds (Async)...")
+        logger.info(f"📡 Polling {len(settings.DOMAINS)} RSS feeds...")
 
         raw_docs = await self._fetch_feeds()
         if not raw_docs:
@@ -370,11 +376,21 @@ async def main():
     print("Initializing AI Regulatory Digest Agent...")
 
     # Observability Setup
-    if settings.LANGCHAIN_API_KEY:
-        os.environ["LANGCHAIN_TRACING_V2"] = settings.LANGCHAIN_TRACING_V2
-        os.environ["LANGCHAIN_PROJECT"] = settings.LANGCHAIN_PROJECT
-        os.environ["LANGCHAIN_API_KEY"] = settings.LANGCHAIN_API_KEY
-        print("🔭 Observability: LangSmith Tracing Enabled")
+    os.environ["PHOENIX_PROJECT_NAME"] = "RSS_Digest_Agent"
+    os.environ["PHOENIX_HOST"] = f"{settings.PHOENIX_HOST}:{settings.PHOENIX_PORT}"
+    os.environ["OTEL_EXPORTER_OTLP_ENDPOINT"] = (
+        f"{settings.PHOENIX_HOST}:{settings.PHOENIX_PORT}"
+    )
+    LangchainInstrumentor().instrument()
+    print(
+        f"Observability: Arize Phoenix (local @ {settings.PHOENIX_HOST}:{settings.PHOENIX_PORT})"
+    )
+
+    # Initialise OpenTelemetry → Phoenix
+    trace.set_tracer_provider(TracerProvider())
+    otlp_exporter = OTLPSpanExporter(endpoint=f"localhost:4317", insecure=True)
+    span_processor = BatchSpanProcessor(otlp_exporter)
+    trace.get_tracer_provider().add_span_processor(span_processor)
 
     # Init Models and Ingestion
     models = ModelManager()

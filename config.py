@@ -28,9 +28,8 @@ class Settings(BaseSettings):
     MAX_INPUT_TOKENS: int = 1500  # Max tokens to feed extraction node
 
     # --- Observability ---
-    LANGCHAIN_TRACING_V2: str = "true"
-    LANGCHAIN_PROJECT: str = "RSS_Digest_Agent"
-    LANGCHAIN_API_KEY: Optional[str] = None
+    PHOENIX_PORT: int = 6006
+    PHOENIX_HOST: str = "http://localhost"
 
     # --- PROMPTS ---
     # Storing prompts here allows for easier tuning without touching code
