@@ -1,19 +1,26 @@
-from dotenv import load_dotenv
+import logging
+import sys
 import os
-from typing import TypedDict, List
-from operator import itemgetter
-import argparse
+import asyncio
+from typing import TypedDict, List, Tuple, Optional
 
 import torch
+from pydantic import BaseModel, Field
+
+# LangChain / HuggingFace Imports
 from langchain_community.document_loaders import RSSFeedLoader
 from langchain_huggingface import HuggingFaceEmbeddings, HuggingFacePipeline
 from langchain_chroma import Chroma
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_core.runnables import RunnablePassthrough
+from langchain_experimental.text_splitter import SemanticChunker
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.documents import Document
+from langchain_core.output_parsers import PydanticOutputParser, StrOutputParser
+from langchain_community.retrievers import BM25Retriever
+from langchain_community.vectorstores.utils import filter_complex_metadata
 from langgraph.graph import StateGraph, END
 
+# Transformers / Sentence Transformers
+from sentence_transformers import CrossEncoder
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
@@ -21,152 +28,385 @@ from transformers import (
     BitsAndBytesConfig,
 )
 
-def parse_args() -> argparse.Namespace:
-    """Parse command-line arguments for flexibility."""
-    parser = argparse.ArgumentParser(description="LLM-based RSS News Digest")
-    parser.add_argument("--query", type=str, default="Top world news highlights", help="Query for news retrieval")
-    parser.add_argument("--k", type=int, default=10, help="Number of documents to retrieve")
-    parser.add_argument("--max_tokens", type=int, default=1024, help="Max new tokens for LLM generation")
-    parser.add_argument("--temperature", type=float, default=0.7, help="LLM sampling temperature")
-    return parser.parse_args()
+from config import settings
 
-def main() -> None:
-    """Main execution flow: load config, process RSS, build RAG, run workflow."""
-    args = parse_args()
-    load_dotenv()
+# --- Logging Setup ---
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)],
+)
+logger = logging.getLogger("RSS_Agent")
 
-    # Config loading with defaults
-    llm_model_name = os.getenv("LLM_MODEL_NAME", "microsoft/Phi-4-mini-instruct")
-    user_profile = os.getenv("USER_PROFILE", "Busy professional seeking quick world news highlights.")
-    embedding_model = os.getenv("HUGGINGFACE_EMBEDDING_MODEL", "all-MiniLM-L6-v2")
-    chunk_size = int(os.getenv("CHUNK_SIZE", "1000"))
-    chunk_overlap = int(os.getenv("CHUNK_OVERLAP", "200"))
 
-    # RSS loading
-    urls = [u.strip() for u in os.getenv("DOMAINS", "").split(",") if u.strip()]
-    if not urls:
-        raise ValueError("No RSS domains provided in .env")
-    loader = RSSFeedLoader(urls=urls)
-    data = loader.load()
-
-    # Document splitting and cleaning
-    splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
-    splits = splitter.split_documents(data)
-    cleaned_splits = [clean_doc(doc) for doc in splits]
-
-    # Vector store setup
-    embeddings = HuggingFaceEmbeddings(model_name=embedding_model)
-    vectorstore = Chroma.from_documents(documents=cleaned_splits, embedding=embeddings)
-    retriever = vectorstore.as_retriever(search_kwargs={"k": args.k})
-
-    # LLM setup with quantization
-    bnb_config = BitsAndBytesConfig(
-        load_in_4bit=True,
-        bnb_4bit_quant_type="nf4",
-        bnb_4bit_compute_dtype=torch.float16,
+# --- Data Models ---
+class ExtractionResult(BaseModel):
+    is_relevant: bool = Field(
+        description="Set to True ONLY if content matches the user profile specific needs."
     )
-    tokenizer = AutoTokenizer.from_pretrained(llm_model_name)
-    model = AutoModelForCausalLM.from_pretrained(
-        llm_model_name,
-        quantization_config=bnb_config,
-        device_map="auto",
-        trust_remote_code=False,
+    relevant_facts: str = Field(
+        description="A concise bulleted list of extracted facts. Leave empty if not relevant."
     )
-    pipe = pipeline(
-        "text-generation",
-        model=model,
-        tokenizer=tokenizer,
-        max_new_tokens=args.max_tokens,
-        temperature=args.temperature,
-        do_sample=True,
-        return_full_text=False,
+    relevance_score: int = Field(
+        description="Integer score 1-10. 10 is a perfect match."
     )
-    llm = HuggingFacePipeline(pipeline=pipe)
 
-    # Workflow definition
-    workflow = build_workflow(llm)
 
-    # Input and execution
-    input_data = {"query": args.query, "user_profile": user_profile}
-    initial_state = build_retrieval_chain(retriever).invoke(input_data)
-    final_state = workflow.invoke(initial_state)
-
-    print("\n=== FINAL SUMMARY ===")
-    print(final_state["final_summary"].strip())
-    print("====================")
-
-def clean_doc(doc: Document) -> Document:
-    """Clean document metadata to ensure serializability."""
-    cleaned = {}
-    for k, v in doc.metadata.items():
-        if isinstance(v, (str, int, float, bool)) or v is None:
-            cleaned[k] = v
-        elif isinstance(v, list):
-            cleaned[k] = v[0] if len(v) == 1 else ", ".join(map(str, v)) if v else None
-        else:
-            cleaned[k] = str(v)
-    return Document(page_content=doc.page_content, metadata=cleaned)
-
-class SummaryState(TypedDict):
-    """State for summary workflow."""
+class AgentState(TypedDict):
+    original_query: str
+    current_query: str
     user_profile: str
-    query: str
-    documents: List[Document]
-    extracted_text: str
-    final_summary: str
+    candidate_docs: List[Document]
+    reranked_docs: List[Document]
+    extracted_data: List[str]
+    final_digest: str
+    retry_count: int
 
-def extract_critical_updates(llm, state: SummaryState) -> dict:
-    """Extract raw relevant text segments based on user profile."""
-    context = "\n---\n".join(doc.page_content for doc in state["documents"])
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                "Critical filter: Extract ONLY raw text segments highly relevant to USER PROFILE. No rephrasing/additions.\n\nUSER PROFILE: {user_profile}\n\nARTICLES:\n{context}",
-            ),
-            ("human", "Extract critical raw updates."),
-        ]
+
+# --- Service: Model Management ---
+class ModelManager:
+    """Singleton-like manager for heavy AI models to handle lazy loading."""
+
+    def __init__(self):
+        self._llm = None
+        self._embeddings = None
+        self._reranker = None
+        self._tokenizer = None
+
+    @property
+    def embeddings(self):
+        if not self._embeddings:
+            logger.info(f"🧠 Loading Embeddings: {settings.EMBEDDING_MODEL}")
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            self._embeddings = HuggingFaceEmbeddings(
+                model_name=settings.EMBEDDING_MODEL,
+                model_kwargs={"device": device},
+                encode_kwargs={"normalize_embeddings": True},
+            )
+        return self._embeddings
+
+    @property
+    def reranker(self):
+        if not self._reranker:
+            logger.info(f"⚖️ Loading Reranker: {settings.RERANKER_MODEL}")
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            self._reranker = CrossEncoder(settings.RERANKER_MODEL, device=device)
+        return self._reranker
+
+    @property
+    def tokenizer(self):
+        if not self._tokenizer:
+            self._tokenizer = AutoTokenizer.from_pretrained(settings.LLM_MODEL_ID)
+        return self._tokenizer
+
+    @property
+    def llm(self):
+        if not self._llm:
+            logger.info(f"🧠 Loading LLM: {settings.LLM_MODEL_ID} (4-bit)...")
+
+            # Ensure tokenizer is loaded
+            _ = self.tokenizer
+
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_use_double_quant=True,
+            )
+
+            model = AutoModelForCausalLM.from_pretrained(
+                settings.LLM_MODEL_ID,
+                quantization_config=bnb_config,
+                device_map="auto",
+            )
+
+            pipe = pipeline(
+                "text-generation",
+                model=model,
+                tokenizer=self._tokenizer,
+                max_new_tokens=1024,
+                temperature=0.1,
+                return_full_text=False,
+            )
+            self._llm = HuggingFacePipeline(pipeline=pipe)
+        return self._llm
+
+    def truncate_text(self, text: str, max_tokens: int) -> str:
+        """Truncates text to fit context window based on token count."""
+        tokens = self.tokenizer.encode(text, add_special_tokens=False)
+        if len(tokens) <= max_tokens:
+            return text
+
+        return (
+            self.tokenizer.decode(tokens[:max_tokens], skip_special_tokens=True) + "..."
+        )
+
+
+# --- Service: Ingestion & Indexing ---
+class IngestionEngine:
+    def __init__(self, model_manager: ModelManager):
+        self.models = model_manager
+
+    async def run(self) -> Tuple[Optional[any], Optional[any]]:
+        """Orchestrates loading, chunking, and indexing."""
+        logger.info(f"📡 Polling {len(settings.DOMAINS)} RSS feeds (Async)...")
+
+        raw_docs = await self._fetch_feeds()
+        if not raw_docs:
+            logger.warning("❌ No documents found in feeds.")
+            return None, None
+
+        split_docs = self._chunk_documents(raw_docs)
+        return self._create_retrievers(split_docs)
+
+    async def _fetch_feeds(self) -> List[Document]:
+        def blocking_load():
+            try:
+                # Add headers/timeout handling if needed in future
+                loader = RSSFeedLoader(urls=settings.DOMAINS)
+                return loader.load()
+            except Exception as e:
+                logger.error(f"Failed to load RSS feeds: {e}")
+                return []
+
+        return await asyncio.to_thread(blocking_load)
+
+    def _chunk_documents(self, docs: List[Document]) -> List[Document]:
+        logger.info("🔪 Chunking Documents (Semantic)...")
+        try:
+            text_splitter = SemanticChunker(
+                self.models.embeddings, breakpoint_threshold_type="percentile"
+            )
+            split_docs = text_splitter.split_documents(docs)
+        except Exception as e:
+            logger.warning(f"Semantic chunking failed ({e}), falling back to raw docs.")
+            split_docs = docs
+
+        split_docs = filter_complex_metadata(split_docs)
+        logger.info(f"   -> Generated {len(split_docs)} chunks.")
+        return split_docs
+
+    def _create_retrievers(self, docs: List[Document]):
+        # Chroma (Vector)
+        vectorstore = Chroma.from_documents(
+            documents=docs,
+            embedding=self.models.embeddings,
+            persist_directory=settings.CHROMA_PATH,
+        )
+        chroma_retriever = vectorstore.as_retriever(
+            search_kwargs={"k": settings.K_RETRIEVAL}
+        )
+
+        # BM25 (Keyword)
+        bm25_retriever = BM25Retriever.from_documents(docs)
+        bm25_retriever.k = settings.K_RETRIEVAL
+
+        return chroma_retriever, bm25_retriever
+
+
+# --- Graph Nodes ---
+class AgentNodes:
+    def __init__(self, model_manager: ModelManager, vector_retriever, bm25_retriever):
+        self.models = model_manager
+        self.vector_retriever = vector_retriever
+        self.bm25_retriever = bm25_retriever
+
+    def retrieve(self, state: AgentState) -> AgentState:
+        query = state["current_query"]
+        logger.info(f"🔎 Retrieving: '{query}'")
+
+        # Hybrid Search
+        v_docs = self.vector_retriever.invoke(query)
+        b_docs = self.bm25_retriever.invoke(query)
+
+        # Deduplicate based on content hash or direct string match
+        # Using a dictionary preserves order of insertion (Python 3.7+)
+        unique_docs = {d.page_content: d for d in v_docs + b_docs}
+        combined = list(unique_docs.values())
+
+        logger.info(f"   -> Found {len(combined)} unique candidates")
+        return {"candidate_docs": combined}
+
+    def rerank(self, state: AgentState) -> AgentState:
+        docs = state["candidate_docs"]
+        if not docs:
+            return {"reranked_docs": []}
+
+        logger.info("⚖️ Reranking candidates...")
+        pairs = [[state["current_query"], d.page_content] for d in docs]
+
+        # Batch prediction
+        scores = self.models.reranker.predict(pairs)
+
+        # Zip, sort by score desc, extract top K
+        scored_docs = sorted(zip(docs, scores), key=lambda x: x[1], reverse=True)
+        top_k = [d for d, s in scored_docs[: settings.K_FINAL]]
+
+        if scored_docs:
+            logger.info(f"   -> Top Match Score: {scored_docs[0][1]:.4f}")
+
+        return {"reranked_docs": top_k}
+
+    def extract(self, state: AgentState) -> AgentState:
+        logger.info("🧪 Extracting Intelligence...")
+        parser = PydanticOutputParser(pydantic_object=ExtractionResult)
+
+        prompt = ChatPromptTemplate.from_template(
+            settings.PROMPTS["extraction_system"]
+        ).partial(format_instructions=parser.get_format_instructions())
+
+        chain = prompt | self.models.llm | parser
+        valid_extracts = []
+
+        for doc in state["reranked_docs"]:
+            try:
+                # Safety truncation
+                safe_content = self.models.truncate_text(
+                    doc.page_content, settings.MAX_INPUT_TOKENS
+                )
+
+                res = chain.invoke(
+                    {
+                        "user_profile": state["user_profile"],
+                        "content": safe_content,
+                    }
+                )
+
+                if (
+                    res.is_relevant
+                    and res.relevance_score >= settings.MIN_RELEVANCE_SCORE
+                ):
+                    source = doc.metadata.get("title", "Unknown Source")
+                    snippet = (
+                        f"**Source:** {source}\n"
+                        f"**Relevance:** {res.relevance_score}/10\n"
+                        f"**Facts:**\n{res.relevant_facts}"
+                    )
+                    valid_extracts.append(snippet)
+                    logger.info(f"   -> Extracted info from '{source[:20]}...'")
+
+            except Exception as e:
+                # Log debug to avoid spamming console on parsing errors
+                logger.debug(f"Extraction error on doc chunk: {e}")
+                continue
+
+        return {"extracted_data": valid_extracts}
+
+    def rewrite_query(self, state: AgentState) -> AgentState:
+        logger.info("🔄 Strategy: Expanding Search Query...")
+
+        msg = settings.PROMPTS["rewrite_template"].format(
+            original=state["original_query"], current=state["current_query"]
+        )
+
+        # Simple string invocation
+        new_query = self.models.llm.invoke(msg).strip().replace('"', "")
+        logger.info(f"   -> New Query: {new_query}")
+
+        return {"current_query": new_query, "retry_count": state["retry_count"] + 1}
+
+    def summarize(self, state: AgentState) -> AgentState:
+        logger.info("📝 Generating Final Brief...")
+        if not state["extracted_data"]:
+            return {"final_digest": "No significant intelligence found after analysis."}
+
+        context = "\n\n".join(state["extracted_data"])
+        safe_context = self.models.truncate_text(context, 3000)
+
+        chain = (
+            ChatPromptTemplate.from_template(settings.PROMPTS["summarize_system"])
+            | self.models.llm
+            | StrOutputParser()
+        )
+
+        result = chain.invoke(
+            {"context": safe_context, "user_profile": state["user_profile"]}
+        )
+
+        return {"final_digest": result}
+
+    def decide_next_step(self, state: AgentState) -> str:
+        """Conditional routing logic."""
+        if state["extracted_data"]:
+            return "summarize"
+        if state["retry_count"] < settings.MAX_RETRIES:
+            return "rewrite"
+        return END
+
+
+# --- Application Builder ---
+def build_graph(chroma, bm25, model_manager):
+    nodes = AgentNodes(model_manager, chroma, bm25)
+    workflow = StateGraph(AgentState)
+
+    # Add Nodes
+    workflow.add_node("retrieve", nodes.retrieve)
+    workflow.add_node("rerank", nodes.rerank)
+    workflow.add_node("extract", nodes.extract)
+    workflow.add_node("rewrite", nodes.rewrite_query)
+    workflow.add_node("summarize", nodes.summarize)
+
+    # Set Entry Point
+    workflow.set_entry_point("retrieve")
+
+    # Add Standard Edges
+    workflow.add_edge("retrieve", "rerank")
+    workflow.add_edge("rerank", "extract")
+
+    # Add Conditional Edges
+    workflow.add_conditional_edges(
+        "extract",
+        nodes.decide_next_step,
+        {"summarize": "summarize", "rewrite": "rewrite", END: END},
     )
-    chain = prompt | llm
-    result = chain.invoke({"context": context, "user_profile": state["user_profile"]})
-    return {"extracted_text": result}
 
-def generate_final_summary(llm, state: SummaryState) -> dict:
-    """Synthesize extracted text into actionable bullet points."""
-    prompt = ChatPromptTemplate.from_messages(
-        [
-            (
-                "system",
-                "Synthesize EXTRACTED TEXT into high-priority, actionable bullet points matching USER PROFILE.\n\nUSER PROFILE: {user_profile}\n\nEXTRACTED TEXT:\n{extracted_text}",
-            ),
-            ("human", "Generate final news summary."),
-        ]
-    )
-    chain = prompt | llm
-    result = chain.invoke({"extracted_text": state["extracted_text"], "user_profile": state["user_profile"]})
-    return {"final_summary": result}
-
-def build_retrieval_chain(retriever):
-    """Build retrieval chain for initial state."""
-    return RunnablePassthrough.assign(
-        documents=itemgetter("query") | retriever, user_profile=itemgetter("user_profile")
-    ) | RunnablePassthrough.assign(
-        query=itemgetter("query"),
-        user_profile=itemgetter("user_profile"),
-        documents=itemgetter("documents"),
-        extracted_text=lambda _: "",
-        final_summary=lambda _: "",
-    )
-
-def build_workflow(llm):
-    """Construct LangGraph workflow."""
-    workflow = StateGraph(SummaryState)
-    workflow.add_node("extract", lambda state: extract_critical_updates(llm, state))
-    workflow.add_node("summarize", lambda state: generate_final_summary(llm, state))
-    workflow.set_entry_point("extract")
-    workflow.add_edge("extract", "summarize")
+    workflow.add_edge("rewrite", "retrieve")
     workflow.add_edge("summarize", END)
+
     return workflow.compile()
 
+
+async def main():
+    print("Initializing AI Regulatory Digest Agent...")
+
+    # Observability Setup
+    if settings.LANGCHAIN_API_KEY:
+        os.environ["LANGCHAIN_TRACING_V2"] = settings.LANGCHAIN_TRACING_V2
+        os.environ["LANGCHAIN_PROJECT"] = settings.LANGCHAIN_PROJECT
+        os.environ["LANGCHAIN_API_KEY"] = settings.LANGCHAIN_API_KEY
+        print("🔭 Observability: LangSmith Tracing Enabled")
+
+    # Init Models and Ingestion
+    models = ModelManager()
+    ingestor = IngestionEngine(models)
+
+    chroma, bm25 = await ingestor.run()
+
+    if not chroma:
+        sys.exit("Critical Error: Knowledge base construction failed.")
+
+    # Build and Run Graph
+    app = build_graph(chroma, bm25, models)
+
+    initial_state = {
+        "original_query": settings.QUERY,
+        "current_query": settings.QUERY,
+        "user_profile": settings.USER_PROFILE,
+        "retry_count": 0,
+        "extracted_data": [],
+        "candidate_docs": [],
+        "reranked_docs": [],
+    }
+
+    try:
+        result = await app.ainvoke(initial_state)
+        print("\n" + "=" * 60)
+        print("📢 FINAL EXECUTIVE BRIEF")
+        print("=" * 60)
+        print(result.get("final_digest", "No data generated."))
+    except Exception as e:
+        logger.error(f"Graph execution failed: {e}")
+
+
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
