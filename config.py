@@ -69,6 +69,7 @@ class Settings(BaseSettings):
     # --- Evaluation ---
     ENABLE_EVALUATION: bool = True
     RAGAS_METRICS: List[str] = ["faithfulness", "answer_relevance"]
+    EVALUATION_THRESHOLD: float = 0.6
 
     # --- Config ---
     prompts: PromptSettings = PromptSettings()

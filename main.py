@@ -40,16 +40,13 @@ async def main():
     print("🚀 Initializing AI Regulatory Digest Agent...")
     setup_telemetry()
 
-    # Initialize Core Components
     models = ModelManager()
     ingestor = IngestionEngine(models)
 
-    # Load Data
     chroma, bm25 = await ingestor.run()
     if not chroma:
         sys.exit("Critical Error: Knowledge base construction failed.")
 
-    # Build Agent
     app = build_graph(chroma, bm25, models)
 
     initial_state = {
@@ -64,15 +61,32 @@ async def main():
 
     try:
         result = await app.ainvoke(initial_state)
-
-        print("\n" + "=" * 60)
-        print("📢 FINAL EXECUTIVE BRIEF")
-        print("=" * 60)
-        print(result.get("final_digest", "No data generated."))
+        final_digest = result.get("final_digest", "No data generated.")
 
         if settings.ENABLE_EVALUATION and result.get("extracted_data"):
+            print("\n🧐 Validating Output Quality...")
             evaluator = RagasEvaluator(models)
-            evaluator.run_eval(result)
+            is_valid, scores = evaluator.run_eval(result)
+
+            if is_valid:
+                print("\n" + "=" * 60)
+                print("📢 FINAL EXECUTIVE BRIEF (Verified)")
+                print("=" * 60)
+                print(final_digest)
+            else:
+                print("\n" + "!" * 60)
+                print("⛔ OUTPUT REJECTED")
+                print("=" * 60)
+                print("The generated response did not meet quality standards.")
+                print(
+                    f"Reason: Low relevance/faithfulness scores (Threshold: {settings.EVALUATION_THRESHOLD})."
+                )
+                print("Recommendation: Broaden search queries or increase K_RETRIEVAL.")
+        else:
+            print("\n" + "=" * 60)
+            print("📢 FINAL EXECUTIVE BRIEF (Unverified)")
+            print("=" * 60)
+            print(final_digest)
 
     except Exception as e:
         logging.error(f"Graph execution failed: {e}")

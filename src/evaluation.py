@@ -14,16 +14,25 @@ class RagasEvaluator:
         self.models = model_manager
 
     def run_eval(self, state):
+        """
+        Runs Ragas evaluation and determines if output passes quality checks.
+        Returns: Tuple(bool, dict) -> (is_passed, scores)
+        """
         logger.info("📊 Starting Ragas Evaluation...")
+
+        if (
+            not state.get("extracted_data")
+            or "No significant intelligence" in state["final_digest"]
+        ):
+            logger.warning("⚠️ No extracted data to evaluate. Skipping Ragas.")
+            return False, {}
 
         full_query = (
             f"{state['original_query']} for user profile: {state['user_profile']}"
         )
-        contexts = (
-            state["extracted_data"]
-            if state["extracted_data"]
-            else [d.page_content for d in state["reranked_docs"]]
-        )
+
+        # Ensure contexts is a list of strings
+        contexts = state["extracted_data"]
 
         data = {
             "user_input": [full_query],
@@ -50,11 +59,47 @@ class RagasEvaluator:
                 llm=evaluator_llm,
                 embeddings=evaluator_embeddings,
             )
+
+            scores = results
+
+            # Calculate average score (ignoring NaNs)
+            valid_scores = [v for k, v in scores.items() if isinstance(v, (int, float))]
+            avg_score = sum(valid_scores) / len(valid_scores) if valid_scores else 0.0
+
+            rel_score = scores.get("answer_relevance", 0.0)
+            faith_score = scores.get("faithfulness", 0.0)
+
             print("\n" + "=" * 30)
-            print("📈 RAGAS EVALUATION REPORT")
+            print(
+                f"📈 RAGAS SCORE: {avg_score:.2f} (Thresh: {settings.EVALUATION_THRESHOLD})"
+            )
+            print(f"   - Relevance: {rel_score}")
+            print(f"   - Faithfulness: {faith_score}")
             print("=" * 30)
-            print(results)
-            return results
+
+            is_passed = True
+
+            import math
+
+            if math.isnan(rel_score):
+                rel_score = 0.0
+            if math.isnan(faith_score):
+                faith_score = 0.0
+
+            if rel_score < settings.EVALUATION_THRESHOLD:
+                logger.error(
+                    f"❌ REJECTED: Relevance {rel_score:.2f} < {settings.EVALUATION_THRESHOLD}"
+                )
+                is_passed = False
+
+            if faith_score < settings.EVALUATION_THRESHOLD:
+                logger.error(
+                    f"❌ REJECTED: Faithfulness {faith_score:.2f} < {settings.EVALUATION_THRESHOLD}"
+                )
+                is_passed = False
+
+            return is_passed, scores
+
         except Exception as e:
             logger.error(f"Ragas evaluation failed: {e}")
-            return None
+            return False, {}
