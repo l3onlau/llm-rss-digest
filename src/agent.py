@@ -1,5 +1,6 @@
 import logging
 from typing import TypedDict, List
+from functools import partial
 from pydantic import BaseModel, Field
 
 from langchain_core.prompts import ChatPromptTemplate
@@ -8,9 +9,11 @@ from langchain_core.output_parsers import PydanticOutputParser, StrOutputParser
 from langgraph.graph import StateGraph, END
 
 from config import settings
-from src.models import ModelManager
+import src.models as models
 
 logger = logging.getLogger("RSS_Agent")
+
+# --- Definitions ---
 
 
 class ExtractionResult(BaseModel):
@@ -32,124 +35,135 @@ class AgentState(TypedDict):
     retry_count: int
 
 
-class AgentNodes:
-    def __init__(self, model_manager: ModelManager, vector_retriever, bm25_retriever):
-        self.models = model_manager
-        self.vector_retriever = vector_retriever
-        self.bm25_retriever = bm25_retriever
+# --- Node Functions ---
 
-    def retrieve(self, state: AgentState) -> AgentState:
-        query = state["current_query"]
-        logger.info(f"🔎 Retrieving: '{query}'")
 
-        # Hybrid Search
-        v_docs = self.vector_retriever.invoke(query)
-        b_docs = self.bm25_retriever.invoke(query)
+def retrieve_node(state: AgentState, vector_retriever, bm25_retriever) -> AgentState:
+    query = state["current_query"]
+    logger.info(f"🔎 Retrieving: '{query}'")
 
-        # Deduplicate
-        unique_docs = {d.page_content: d for d in v_docs + b_docs}
-        combined = list(unique_docs.values())
+    # Hybrid Search
+    v_docs = vector_retriever.invoke(query)
+    b_docs = bm25_retriever.invoke(query)
 
-        logger.info(f"   -> Found {len(combined)} unique candidates")
-        return {"candidate_docs": combined}
+    # Deduplicate
+    unique_docs = {d.page_content: d for d in v_docs + b_docs}
+    combined = list(unique_docs.values())
 
-    def rerank(self, state: AgentState) -> AgentState:
-        docs = state["candidate_docs"]
-        if not docs:
-            return {"reranked_docs": []}
+    logger.info(f"   -> Found {len(combined)} unique candidates")
+    return {"candidate_docs": combined}
 
-        logger.info("⚖️ Reranking candidates...")
-        pairs = [[state["current_query"], d.page_content] for d in docs]
-        scores = self.models.reranker.predict(pairs)
 
-        scored_docs = sorted(zip(docs, scores), key=lambda x: x[1], reverse=True)
-        top_k = [d for d, s in scored_docs[: settings.K_FINAL]]
+def rerank_node(state: AgentState) -> AgentState:
+    docs = state["candidate_docs"]
+    if not docs:
+        return {"reranked_docs": []}
 
-        return {"reranked_docs": top_k}
+    logger.info("⚖️ Reranking candidates...")
+    reranker = models.get_reranker()
+    pairs = [[state["current_query"], d.page_content] for d in docs]
+    scores = reranker.predict(pairs)
 
-    def extract(self, state: AgentState) -> AgentState:
-        logger.info("🧪 Extracting Intelligence...")
-        parser = PydanticOutputParser(pydantic_object=ExtractionResult)
+    scored_docs = sorted(zip(docs, scores), key=lambda x: x[1], reverse=True)
+    top_k = [d for d, s in scored_docs[: settings.K_FINAL]]
 
-        prompt = ChatPromptTemplate.from_template(
-            settings.prompts.EXTRACTION_SYSTEM
-        ).partial(format_instructions=parser.get_format_instructions())
+    return {"reranked_docs": top_k}
 
-        chain = prompt | self.models.llm | parser
-        valid_extracts = []
 
-        for doc in state["reranked_docs"]:
-            try:
-                safe_content = self.models.truncate_text(
-                    doc.page_content, settings.MAX_INPUT_TOKENS
+def extract_node(state: AgentState) -> AgentState:
+    logger.info("⛏️ Extracting Intelligence...")
+    parser = PydanticOutputParser(pydantic_object=ExtractionResult)
+    llm = models.get_llm()
+
+    prompt = ChatPromptTemplate.from_template(
+        settings.prompts.EXTRACTION_SYSTEM
+    ).partial(format_instructions=parser.get_format_instructions())
+
+    chain = prompt | llm | parser
+    valid_extracts = []
+
+    for doc in state["reranked_docs"]:
+        try:
+            safe_content = models.truncate_text(
+                doc.page_content, settings.MAX_INPUT_TOKENS
+            )
+            res = chain.invoke(
+                {"user_profile": state["user_profile"], "content": safe_content}
+            )
+
+            if res.is_relevant and res.relevance_score >= settings.MIN_RELEVANCE_SCORE:
+                source = doc.metadata.get("title", "Unknown Source")
+                snippet = (
+                    f"**Source:** {source}\n"
+                    f"**Relevance:** {res.relevance_score}/10\n"
+                    f"**Facts:**\n{res.relevant_facts}"
                 )
-                res = chain.invoke(
-                    {"user_profile": state["user_profile"], "content": safe_content}
-                )
+                valid_extracts.append(snippet)
+                logger.info(f"   -> Extracted info from '{source[:20]}...'")
 
-                if (
-                    res.is_relevant
-                    and res.relevance_score >= settings.MIN_RELEVANCE_SCORE
-                ):
-                    source = doc.metadata.get("title", "Unknown Source")
-                    snippet = (
-                        f"**Source:** {source}\n"
-                        f"**Relevance:** {res.relevance_score}/10\n"
-                        f"**Facts:**\n{res.relevant_facts}"
-                    )
-                    valid_extracts.append(snippet)
-                    logger.info(f"   -> Extracted info from '{source[:20]}...'")
+        except Exception as e:
+            logger.debug(f"Extraction error: {e}")
+            continue
 
-            except Exception as e:
-                logger.debug(f"Extraction error: {e}")
-                continue
-
-        return {"extracted_data": valid_extracts}
-
-    def rewrite_query(self, state: AgentState) -> AgentState:
-        logger.info("🔄 Strategy: Expanding Search Query...")
-        msg = settings.prompts.REWRITE_TEMPLATE.format(
-            original=state["original_query"], current=state["current_query"]
-        )
-        new_query = self.models.llm.invoke(msg).strip().replace('"', "")
-        logger.info(f"   -> New Query: {new_query}")
-        return {"current_query": new_query, "retry_count": state["retry_count"] + 1}
-
-    def summarize(self, state: AgentState) -> AgentState:
-        logger.info("📝 Generating Final Brief...")
-        if not state["extracted_data"]:
-            return {"final_digest": "No significant intelligence found after analysis."}
-
-        context = "\n\n".join(state["extracted_data"])
-        safe_context = self.models.truncate_text(context, 3000)
-
-        chain = (
-            ChatPromptTemplate.from_template(settings.prompts.SUMMARIZE_SYSTEM)
-            | self.models.llm
-            | StrOutputParser()
-        )
-        result = chain.invoke(
-            {"context": safe_context, "user_profile": state["user_profile"]}
-        )
-        return {"final_digest": result}
-
-    def decide_next_step(self, state: AgentState) -> str:
-        if state["extracted_data"]:
-            return "summarize"
-        if state["retry_count"] < settings.MAX_RETRIES:
-            return "rewrite"
-        return END
+    return {"extracted_data": valid_extracts}
 
 
-def build_graph(chroma_retriever, bm25_retriever, model_manager):
-    nodes = AgentNodes(model_manager, chroma_retriever, bm25_retriever)
+def rewrite_query_node(state: AgentState) -> AgentState:
+    logger.info("🔄 Strategy: Expanding Search Query...")
+    msg = settings.prompts.REWRITE_TEMPLATE.format(
+        original=state["original_query"], current=state["current_query"]
+    )
+    llm = models.get_llm()
+    new_query = llm.invoke(msg).strip().replace('"', "")
+    logger.info(f"   -> New Query: {new_query}")
+    return {"current_query": new_query, "retry_count": state["retry_count"] + 1}
+
+
+def summarize_node(state: AgentState) -> AgentState:
+    logger.info("📝 Generating Final Brief...")
+    if not state["extracted_data"]:
+        return {"final_digest": "No significant intelligence found after analysis."}
+
+    context = "\n\n".join(state["extracted_data"])
+    safe_context = models.truncate_text(context, 3000)
+    llm = models.get_llm()
+
+    chain = (
+        ChatPromptTemplate.from_template(settings.prompts.SUMMARIZE_SYSTEM)
+        | llm
+        | StrOutputParser()
+    )
+    result = chain.invoke(
+        {"context": safe_context, "user_profile": state["user_profile"]}
+    )
+    return {"final_digest": result}
+
+
+def decide_next_step(state: AgentState) -> str:
+    if state["extracted_data"]:
+        return "summarize"
+    if state["retry_count"] < settings.MAX_RETRIES:
+        return "rewrite"
+    return END
+
+
+# --- Graph Builder ---
+
+
+def build_graph(chroma_retriever, bm25_retriever):
     workflow = StateGraph(AgentState)
 
-    workflow.add_node("retrieve", nodes.retrieve)
-    workflow.add_node("rerank", nodes.rerank)
-    workflow.add_node("extract", nodes.extract)
-    workflow.add_node("rewrite", nodes.rewrite_query)
-    workflow.add_node("summarize", nodes.summarize)
+    # Use partial application to inject the retrievers into the retrieve_node
+    # This keeps the node signature clean for LangGraph while passing dependencies
+    retrieve_with_deps = partial(
+        retrieve_node, vector_retriever=chroma_retriever, bm25_retriever=bm25_retriever
+    )
+
+    workflow.add_node("retrieve", retrieve_with_deps)
+    workflow.add_node("rerank", rerank_node)
+    workflow.add_node("extract", extract_node)
+    workflow.add_node("rewrite", rewrite_query_node)
+    workflow.add_node("summarize", summarize_node)
 
     workflow.set_entry_point("retrieve")
     workflow.add_edge("retrieve", "rerank")
@@ -157,7 +171,7 @@ def build_graph(chroma_retriever, bm25_retriever, model_manager):
 
     workflow.add_conditional_edges(
         "extract",
-        nodes.decide_next_step,
+        decide_next_step,
         {"summarize": "summarize", "rewrite": "rewrite", END: END},
     )
     workflow.add_edge("rewrite", "retrieve")

@@ -8,12 +8,10 @@ from opentelemetry.sdk.trace.export import BatchSpanProcessor
 from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
 
 from config import settings
-from src.models import ModelManager
-from src.ingestion import IngestionEngine
+from src.ingestion import run_ingestion
 from src.agent import build_graph
-from src.evaluation import RagasEvaluator
+from src.evaluation import run_evaluation
 
-# Setup Logging
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -40,14 +38,14 @@ async def main():
     print("🚀 Initializing AI Regulatory Digest Agent...")
     setup_telemetry()
 
-    models = ModelManager()
-    ingestor = IngestionEngine(models)
-
-    chroma, bm25 = await ingestor.run()
+    # 1. Ingest Data
+    chroma, bm25 = await run_ingestion()
     if not chroma:
         sys.exit("Critical Error: Knowledge base construction failed.")
 
-    app = build_graph(chroma, bm25, models)
+    # 2. Build Agent Graph
+    # Pass retrievers here; models are loaded lazily via imports inside the graph
+    app = build_graph(chroma, bm25)
 
     initial_state = {
         "original_query": settings.QUERY,
@@ -60,13 +58,14 @@ async def main():
     }
 
     try:
+        # 3. Execute
         result = await app.ainvoke(initial_state)
         final_digest = result.get("final_digest", "No data generated.")
 
+        # 4. Evaluate
         if settings.ENABLE_EVALUATION and result.get("extracted_data"):
             print("\n🧐 Validating Output Quality...")
-            evaluator = RagasEvaluator(models)
-            is_valid, scores = evaluator.run_eval(result)
+            is_valid, scores = run_evaluation(result)
 
             if is_valid:
                 print("\n" + "=" * 60)
@@ -78,10 +77,6 @@ async def main():
                 print("⛔ OUTPUT REJECTED")
                 print("=" * 60)
                 print("The generated response did not meet quality standards.")
-                print(
-                    f"Reason: Low relevance/faithfulness scores (Threshold: {settings.EVALUATION_THRESHOLD})."
-                )
-                print("Recommendation: Broaden search queries or increase K_RETRIEVAL.")
         else:
             print("\n" + "=" * 60)
             print("📢 FINAL EXECUTIVE BRIEF (Unverified)")
