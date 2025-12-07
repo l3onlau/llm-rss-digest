@@ -1,12 +1,13 @@
 import asyncio
 import logging
-from typing import List, Tuple, Optional
-from langchain_community.document_loaders import RSSFeedLoader
+from typing import List, Optional, Tuple
+
 from langchain_chroma import Chroma
-from langchain_experimental.text_splitter import SemanticChunker
+from langchain_community.document_loaders import RSSFeedLoader
 from langchain_community.retrievers import BM25Retriever
 from langchain_community.vectorstores.utils import filter_complex_metadata
 from langchain_core.documents import Document
+from langchain_experimental.text_splitter import SemanticChunker
 
 from config import settings
 from src.models import get_embeddings
@@ -28,8 +29,11 @@ async def run_ingestion() -> Tuple[Optional[any], Optional[any]]:
 
 
 async def _fetch_feeds() -> List[Document]:
+    """Async wrapper for blocking RSS loader."""
+
     def blocking_load():
         try:
+            # RSSFeedLoader handles multiple URLs natively
             loader = RSSFeedLoader(urls=settings.DOMAINS)
             return loader.load()
         except Exception as e:
@@ -40,9 +44,9 @@ async def _fetch_feeds() -> List[Document]:
 
 
 def _chunk_documents(docs: List[Document]) -> List[Document]:
+    """Splits documents based on semantic similarity breakpoints."""
     logger.info("🔪 Chunking Documents (Semantic)...")
     try:
-        # Note: SemanticChunker is computation heavy
         text_splitter = SemanticChunker(
             get_embeddings(), breakpoint_threshold_type="percentile"
         )
@@ -51,13 +55,17 @@ def _chunk_documents(docs: List[Document]) -> List[Document]:
         logger.warning(f"Semantic chunking failed ({e}), falling back to raw docs.")
         split_docs = docs
 
+    # Clean metadata for ChromaDB compatibility
     split_docs = filter_complex_metadata(split_docs)
     logger.info(f"   -> Generated {len(split_docs)} chunks.")
     return split_docs
 
 
 def _create_retrievers(docs: List[Document]):
+    """Builds Hybrid Search Retrievers (Dense + Sparse)."""
     logger.info("💾 Building/Updating Vector Store...")
+
+    # Dense Retriever (Vector)
     vectorstore = Chroma.from_documents(
         documents=docs,
         embedding=get_embeddings(),
@@ -67,6 +75,7 @@ def _create_retrievers(docs: List[Document]):
         search_kwargs={"k": settings.K_RETRIEVAL}
     )
 
+    # Sparse Retriever (Keyword/BM25)
     bm25_retriever = BM25Retriever.from_documents(docs)
     bm25_retriever.k = settings.K_RETRIEVAL
 

@@ -1,9 +1,11 @@
-from typing import List
+from pathlib import Path
+from typing import List, Optional
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class PromptSettings:
-    """Centralized Prompt Templates (Constants)"""
+    """Centralized Prompt Templates."""
 
     EXTRACTION_SYSTEM: str = (
         "You are an expert Intelligence Analyst. Analyze the provided content against "
@@ -36,15 +38,22 @@ class PromptSettings:
 
 
 class Settings(BaseSettings):
+    # --- Content Settings ---
     DOMAINS: List[str] = ["https://feeds.bbci.co.uk/news/technology/rss.xml"]
     QUERY: str = "AI regulation"
-    USER_PROFILE: str = "Tech Analyst"
+    USER_PROFILE: str = "Tech Analyst looking for EU compliance risks"
 
+    # --- Model IDs ---
     LLM_MODEL_ID: str = "microsoft/Phi-4-mini-instruct"
     EMBEDDING_MODEL: str = "BAAI/bge-small-en-v1.5"
     RERANKER_MODEL: str = "BAAI/bge-reranker-base"
 
-    CHROMA_PATH: str = "./chroma_db"
+    # --- Vector DB & Paths ---
+    BASE_DIR: Path = Path(__file__).resolve().parent
+    CHROMA_PATH: str = str(BASE_DIR / "chroma_db")
+    RAGAS_ADAPTER_PATH: Optional[str] = str(BASE_DIR / "ragas_adapter")
+
+    # --- RAG Parameters ---
     CHUNK_SIZE: int = 2000
     CHUNK_OVERLAP: int = 200
     K_RETRIEVAL: int = 15
@@ -53,6 +62,7 @@ class Settings(BaseSettings):
     MIN_RELEVANCE_SCORE: int = 4
     MAX_INPUT_TOKENS: int = 1500
 
+    # --- Telemetry & Eval ---
     PHOENIX_PORT: int = 6006
     PHOENIX_HOST: str = "http://localhost"
     ENABLE_TRACING: bool = True
@@ -61,6 +71,7 @@ class Settings(BaseSettings):
     EVALUATION_THRESHOLD: float = 0.6
 
     prompts: PromptSettings = PromptSettings()
+
     model_config = SettingsConfigDict(
         env_file=".env", env_file_encoding="utf-8", extra="ignore"
     )

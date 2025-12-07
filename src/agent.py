@@ -1,21 +1,20 @@
 import logging
-from typing import TypedDict, List
 from functools import partial
-from pydantic import BaseModel, Field
+from typing import List, TypedDict
 
-from langchain_core.prompts import ChatPromptTemplate
 from langchain_core.documents import Document
 from langchain_core.output_parsers import PydanticOutputParser, StrOutputParser
-from langgraph.graph import StateGraph, END
+from langchain_core.prompts import ChatPromptTemplate
+from langgraph.graph import END, StateGraph
+from pydantic import BaseModel, Field
 
-from config import settings
 import src.models as models
+from config import settings
 
 logger = logging.getLogger("RSS_Agent")
 
-# --- Definitions ---
 
-
+# --- Data Structures ---
 class ExtractionResult(BaseModel):
     is_relevant: bool = Field(description="True ONLY if content matches user profile.")
     relevant_facts: str = Field(
@@ -35,18 +34,15 @@ class AgentState(TypedDict):
     retry_count: int
 
 
-# --- Node Functions ---
-
-
+# --- Nodes ---
 def retrieve_node(state: AgentState, vector_retriever, bm25_retriever) -> AgentState:
     query = state["current_query"]
     logger.info(f"🔎 Retrieving: '{query}'")
 
-    # Hybrid Search
     v_docs = vector_retriever.invoke(query)
     b_docs = bm25_retriever.invoke(query)
 
-    # Deduplicate
+    # Deduplicate based on content
     unique_docs = {d.page_content: d for d in v_docs + b_docs}
     combined = list(unique_docs.values())
 
@@ -64,6 +60,7 @@ def rerank_node(state: AgentState) -> AgentState:
     pairs = [[state["current_query"], d.page_content] for d in docs]
     scores = reranker.predict(pairs)
 
+    # Sort by score descending
     scored_docs = sorted(zip(docs, scores), key=lambda x: x[1], reverse=True)
     top_k = [d for d, s in scored_docs[: settings.K_FINAL]]
 
@@ -102,7 +99,7 @@ def extract_node(state: AgentState) -> AgentState:
                 logger.info(f"   -> Extracted info from '{source[:20]}...'")
 
         except Exception as e:
-            logger.debug(f"Extraction error: {e}")
+            logger.debug(f"Extraction error on doc: {e}")
             continue
 
     return {"extracted_data": valid_extracts}
@@ -148,13 +145,9 @@ def decide_next_step(state: AgentState) -> str:
 
 
 # --- Graph Builder ---
-
-
 def build_graph(chroma_retriever, bm25_retriever):
     workflow = StateGraph(AgentState)
 
-    # Use partial application to inject the retrievers into the retrieve_node
-    # This keeps the node signature clean for LangGraph while passing dependencies
     retrieve_with_deps = partial(
         retrieve_node, vector_retriever=chroma_retriever, bm25_retriever=bm25_retriever
     )

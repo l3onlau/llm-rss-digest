@@ -1,20 +1,23 @@
 import logging
-import torch
 from functools import lru_cache
+
+import torch
+from langchain_huggingface import HuggingFaceEmbeddings, HuggingFacePipeline
+from sentence_transformers import CrossEncoder
 from transformers import (
     AutoModelForCausalLM,
     AutoTokenizer,
-    pipeline,
     BitsAndBytesConfig,
+    pipeline,
 )
-from langchain_huggingface import HuggingFaceEmbeddings, HuggingFacePipeline
-from sentence_transformers import CrossEncoder
+
 from config import settings
 
 logger = logging.getLogger("RSS_Agent")
 
 
 def get_device() -> str:
+    """Determines the optimal hardware accelerator."""
     if torch.cuda.is_available():
         return "cuda"
     elif torch.backends.mps.is_available():
@@ -23,7 +26,7 @@ def get_device() -> str:
 
 
 @lru_cache(maxsize=1)
-def get_embeddings():
+def get_embeddings() -> HuggingFaceEmbeddings:
     """Singleton accessor for Embeddings."""
     device = get_device()
     logger.info(f"🧠 Loading Embeddings ({device}): {settings.EMBEDDING_MODEL}")
@@ -35,7 +38,7 @@ def get_embeddings():
 
 
 @lru_cache(maxsize=1)
-def get_reranker():
+def get_reranker() -> CrossEncoder:
     """Singleton accessor for Reranker."""
     device = get_device()
     logger.info(f"⚖️ Loading Reranker ({device}): {settings.RERANKER_MODEL}")
@@ -48,13 +51,14 @@ def get_tokenizer():
 
 
 @lru_cache(maxsize=1)
-def get_llm():
-    """Singleton accessor for LLM."""
+def get_llm() -> HuggingFacePipeline:
+    """Singleton accessor for LLM with quantization support."""
     device = get_device()
-    logger.info(f"🧠 Loading LLM: {settings.LLM_MODEL_ID}...")
+    logger.info(f"🧠 Loading LLM: {settings.LLM_MODEL_ID} on {device}...")
 
     model_kwargs = {"device_map": "auto"}
 
+    # Apply 4-bit quantization only if CUDA is available
     if device == "cuda":
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
@@ -64,15 +68,20 @@ def get_llm():
         )
         model_kwargs["quantization_config"] = bnb_config
     else:
-        model_kwargs["torch_dtype"] = torch.float16
+        # Fallback for MPS/CPU
+        model_kwargs["torch_dtype"] = (
+            torch.float16 if device == "mps" else torch.float32
+        )
 
     try:
         model = AutoModelForCausalLM.from_pretrained(
             settings.LLM_MODEL_ID, **model_kwargs
         )
 
-        # HuggingFace pipeline needs explicit device argument for MPS/CPU if not using device_map="auto" fully
-        pipe_device = device if device != "cuda" else None
+        # Pipeline setup
+        pipe_device = 0 if device == "cuda" else (-1 if device == "cpu" else None)
+        if device == "mps":
+            pipe_device = None  # MPS handled via model placement
 
         pipe = pipeline(
             "text-generation",
@@ -81,7 +90,8 @@ def get_llm():
             max_new_tokens=1024,
             temperature=0.1,
             return_full_text=False,
-            device=pipe_device,
+            # Note: device argument in pipeline can conflict with device_map in model
+            # keeping it None usually lets accelerate handle it
         )
         return HuggingFacePipeline(pipeline=pipe)
     except Exception as e:
@@ -90,7 +100,7 @@ def get_llm():
 
 
 def truncate_text(text: str, max_tokens: int) -> str:
-    """Helper function to truncate text based on token count."""
+    """Truncates text to a specific token count to fit context windows."""
     tokenizer = get_tokenizer()
     tokens = tokenizer.encode(text, add_special_tokens=False)
     if len(tokens) <= max_tokens:
