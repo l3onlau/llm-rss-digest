@@ -1,6 +1,8 @@
+import os
+
 import torch
 from datasets import load_dataset
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, PeftModel, get_peft_model
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from trl import SFTConfig, SFTTrainer
 
@@ -26,7 +28,7 @@ def format_instruction(sample):
 
     TRAINING NOTE:
     --------------
-    The current QLoRA training step is very small, so **potential overfitting is being ignored** for this phase.
+    **potential overfitting is being ignored** for this phase.
     """
     query = sample["question"]
     context = sample["context"]
@@ -63,7 +65,7 @@ def train():
         bnb_4bit_use_double_quant=True,
     )
 
-    print("🧠 Loading Model...")
+    print("🧠 Loading Base Model...")
     model = AutoModelForCausalLM.from_pretrained(
         settings.LLM_MODEL_ID,
         quantization_config=bnb_config,
@@ -71,29 +73,44 @@ def train():
     )
     model.config.use_cache = False
 
-    # Enable gradients for inputs (required for PEFT + Gradient Checkpointing)
+    # Enable gradients for inputs
     model.gradient_checkpointing_enable(
         gradient_checkpointing_kwargs={"use_reentrant": False}
     )
 
-    # PEFT Config
-    peft_config = LoraConfig(
-        lora_alpha=16,
-        lora_dropout=0.05,
-        r=16,
-        bias="none",
-        task_type="CAUSAL_LM",
-        target_modules=[
-            "q_proj",
-            "k_proj",
-            "v_proj",
-            "o_proj",
-            "gate_proj",
-            "up_proj",
-            "down_proj",
-        ],
-    )
-    model = get_peft_model(model, peft_config)
+    # ------------------------------------------------------------------
+    # AUTO-DETECT: Resume vs Fresh Start
+    # ------------------------------------------------------------------
+    adapter_config_path = os.path.join(OUTPUT_DIR, "adapter_config.json")
+    is_resuming = os.path.exists(adapter_config_path)
+
+    if is_resuming:
+        print(
+            f"🔄 Found existing adapter at {OUTPUT_DIR}. Loading to continue training..."
+        )
+        model = PeftModel.from_pretrained(model, OUTPUT_DIR, is_trainable=True)
+    else:
+        print("🆕 No existing adapter found. Initializing new LoRA...")
+        peft_config = LoraConfig(
+            lora_alpha=32,
+            lora_dropout=0.05,
+            r=16,
+            bias="none",
+            task_type="CAUSAL_LM",
+            target_modules=[
+                "q_proj",
+                "k_proj",
+                "v_proj",
+                "o_proj",
+                "gate_proj",
+                "up_proj",
+                "down_proj",
+            ],
+        )
+        model = get_peft_model(model, peft_config)
+
+    dynamic_lr = 5e-5 if is_resuming else 2e-4
+    print(f"⚙️  Auto-setting Learning Rate to: {dynamic_lr}")
 
     tokenizer = AutoTokenizer.from_pretrained(settings.LLM_MODEL_ID)
     tokenizer.pad_token = tokenizer.eos_token
@@ -101,15 +118,17 @@ def train():
 
     training_args = SFTConfig(
         dataset_text_field="text",
-        max_length=512,
+        max_length=settings.CHUNK_SIZE,
         output_dir=OUTPUT_DIR,
         max_steps=30,
+        eval_steps=15,
         per_device_train_batch_size=1,
         gradient_accumulation_steps=16,
-        learning_rate=2e-4,
+        learning_rate=dynamic_lr,
         fp16=True,
         group_by_length=True,
         logging_steps=5,
+        overwrite_output_dir=True,
     )
 
     trainer = SFTTrainer(

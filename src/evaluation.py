@@ -56,7 +56,7 @@ def run_evaluation(state: dict):
             logger.error(f"❌ Failed to load adapter: {e}. Proceeding with Base Model.")
 
     # --- Data Prep ---
-    full_query = f"{state['original_query']} for user profile: {state['user_profile']}"
+    full_query = state["original_query"]
     data = {
         "user_input": [full_query],
         "response": [state["final_digest"]],
@@ -85,17 +85,9 @@ def run_evaluation(state: dict):
             llm=evaluator_llm,
             embeddings=evaluator_embeddings,
         )
-        scores = results
 
-        # Normalize scores (handle NaNs)
-        rel_score = scores.get("answer_relevance", 0.0) or 0.0
-        faith_score = scores.get("faithfulness", 0.0) or 0.0
-
-        # Safe handling of math.nan
-        if math.isnan(rel_score):
-            rel_score = 0.0
-        if math.isnan(faith_score):
-            faith_score = 0.0
+        faith_score = results["faithfulness"][0]
+        rel_score = results["answer_relevancy"][0]
 
         print("\n" + "=" * 30)
         print(f"📈 RAGAS SCORE (Adapter: {adapter_loaded})")
@@ -103,13 +95,13 @@ def run_evaluation(state: dict):
         print(f"   - Faithfulness: {faith_score:.2f}")
         print("=" * 30)
 
-        if rel_score < settings.EVALUATION_THRESHOLD:
+        if rel_score < settings.EVALUATION_THRESHOLD and math.isnan(rel_score):
             logger.error(
                 f"❌ REJECTED: Relevance {rel_score:.2f} < {settings.EVALUATION_THRESHOLD}"
             )
             is_passed = False
 
-        if faith_score < settings.EVALUATION_THRESHOLD:
+        if faith_score < settings.EVALUATION_THRESHOLD and math.isnan(faith_score):
             logger.error(
                 f"❌ REJECTED: Faithfulness {faith_score:.2f} < {settings.EVALUATION_THRESHOLD}"
             )

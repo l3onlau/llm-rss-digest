@@ -16,7 +16,9 @@ logger = logging.getLogger("RSS_Agent")
 
 # --- Data Structures ---
 class ExtractionResult(BaseModel):
-    is_relevant: bool = Field(description="True ONLY if content matches user profile.")
+    is_relevant: bool = Field(
+        description="True if content contains facts relevant to the Query."
+    )
     relevant_facts: str = Field(
         description="Concise bulleted list of facts. Empty if irrelevant."
     )
@@ -26,7 +28,6 @@ class ExtractionResult(BaseModel):
 class AgentState(TypedDict):
     original_query: str
     current_query: str
-    user_profile: str
     candidate_docs: List[Document]
     reranked_docs: List[Document]
     extracted_data: List[str]
@@ -85,7 +86,7 @@ def extract_node(state: AgentState) -> AgentState:
                 doc.page_content, settings.MAX_INPUT_TOKENS
             )
             res = chain.invoke(
-                {"user_profile": state["user_profile"], "content": safe_content}
+                {"query": state["original_query"], "content": safe_content}
             )
 
             if res.is_relevant and res.relevance_score >= settings.MIN_RELEVANCE_SCORE:
@@ -130,9 +131,7 @@ def summarize_node(state: AgentState) -> AgentState:
         | llm
         | StrOutputParser()
     )
-    result = chain.invoke(
-        {"context": safe_context, "user_profile": state["user_profile"]}
-    )
+    result = chain.invoke({"context": safe_context, "query": state["original_query"]})
     return {"final_digest": result}
 
 

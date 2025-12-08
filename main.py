@@ -52,7 +52,6 @@ async def main():
     initial_state = {
         "original_query": settings.QUERY,
         "current_query": settings.QUERY,
-        "user_profile": settings.USER_PROFILE,
         "retry_count": 0,
         "extracted_data": [],
         "candidate_docs": [],

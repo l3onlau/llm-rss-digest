@@ -8,9 +8,8 @@ class PromptSettings:
     """Centralized Prompt Templates."""
 
     EXTRACTION_SYSTEM: str = (
-        "You are an expert Intelligence Analyst. Analyze the provided content against "
-        "the User Profile.\n\n"
-        "USER PROFILE: {user_profile}\n"
+        "You are an expert Intelligence Analyst. Analyze the provided content "
+        "relevance to the Query: '{query}'.\n\n"
         "CONTENT_CHUNK: {content}\n\n"
         "{format_instructions}"
     )
@@ -25,10 +24,10 @@ class PromptSettings:
     SUMMARIZE_SYSTEM: str = (
         "<|system|>\n"
         "You are an executive analyst. Create a high-level briefing based ONLY on the provided intelligence.\n"
+        "Focus on answering the Query: '{query}'.\n"
         "Cite sources where possible.\n"
         "<|end|>\n"
         "<|user|>\n"
-        "USER PROFILE: {user_profile}\n\n"
         "INTELLIGENCE REPORTS:\n"
         "{context}\n\n"
         "TASK: Write a structured executive summary.\n"
@@ -39,9 +38,12 @@ class PromptSettings:
 
 class Settings(BaseSettings):
     # --- Content Settings ---
-    DOMAINS: List[str] = ["https://feeds.bbci.co.uk/news/technology/rss.xml"]
-    QUERY: str = "AI regulation"
-    USER_PROFILE: str = "Tech Analyst looking for EU compliance risks"
+    DOMAINS: List[str] = [
+        "https://feeds.bbci.co.uk/news/world/rss.xml",
+        "https://rss.nytimes.com/services/xml/rss/nyt/World.xml",
+        "https://www.channelnewsasia.com/api/v1/rss-outbound-feed?_format=xml",
+    ]
+    QUERY: str = "Economic trends"
 
     # --- Model IDs ---
     LLM_MODEL_ID: str = "microsoft/Phi-4-mini-instruct"

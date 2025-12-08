@@ -78,11 +78,6 @@ def get_llm() -> HuggingFacePipeline:
             settings.LLM_MODEL_ID, **model_kwargs
         )
 
-        # Pipeline setup
-        pipe_device = 0 if device == "cuda" else (-1 if device == "cpu" else None)
-        if device == "mps":
-            pipe_device = None  # MPS handled via model placement
-
         pipe = pipeline(
             "text-generation",
             model=model,

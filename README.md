@@ -1,6 +1,6 @@
 # 📰 LLM RSS Digest Agent (v2.0)
 
-**An intelligent, autonomous agent that monitors RSS feeds, filters noise based on a User Profile, and generates executive briefings using local LLMs.**
+**An intelligent, autonomous agent that monitors RSS feeds, filters noise based on a Query, and generates executive briefings using local LLMs.**
 
 This project demonstrates an advanced **Agentic RAG (Retrieval-Augmented Generation)** workflow using LangGraph, LangChain, and local Hugging Face models. It moves beyond simple "chat with data" to perform active intelligence analysis: fetching, chunking, retrieving, reranking, extracting, summarizing, and self-evaluating.
 
@@ -36,7 +36,7 @@ This repository serves as a reference implementation for several advanced AI Eng
 1.  **Ingest:** Async fetching of RSS feeds $\rightarrow$ Semantic Chunking $\rightarrow$ Indexing (ChromaDB + BM25).
 2.  **Retrieve:** Hybrid search based on the `current_query`.
 3.  **Rerank:** Top results are re-scored by a Cross-Encoder to remove false positives.
-4.  **Extract:** The LLM analyzes each chunk against the `USER_PROFILE` and extracts bullet points.
+4.  **Extract:** The LLM analyzes each chunk against the `QUERY` and extracts bullet points.
 5.  **Decision Loop:**
       * *Found Intel?* $\rightarrow$ **Summarize**.
       * *No Intel?* $\rightarrow$ **Rewrite Query** $\rightarrow$ Loop back to **Retrieve**.
@@ -83,7 +83,7 @@ This repository serves as a reference implementation for several advanced AI Eng
 
 ### 1\. Basic Execution
 
-Open `config.py` to set your topic (e.g., "AI Regulation") and User Profile (e.g., "Compliance Officer"). Then run:
+Open `config.py` to set your query (e.g., "AI Regulation"). Then run:
 
 ```bash
 python main.py
