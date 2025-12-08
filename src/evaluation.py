@@ -76,7 +76,6 @@ def run_evaluation(state: dict):
         )
 
     is_passed = True
-    scores = {}
 
     try:
         results = evaluate(
@@ -95,13 +94,13 @@ def run_evaluation(state: dict):
         print(f"   - Faithfulness: {faith_score:.2f}")
         print("=" * 30)
 
-        if rel_score < settings.EVALUATION_THRESHOLD and math.isnan(rel_score):
+        if rel_score < settings.EVALUATION_THRESHOLD or math.isnan(rel_score):
             logger.error(
                 f"❌ REJECTED: Relevance {rel_score:.2f} < {settings.EVALUATION_THRESHOLD}"
             )
             is_passed = False
 
-        if faith_score < settings.EVALUATION_THRESHOLD and math.isnan(faith_score):
+        if faith_score < settings.EVALUATION_THRESHOLD or math.isnan(faith_score):
             logger.error(
                 f"❌ REJECTED: Faithfulness {faith_score:.2f} < {settings.EVALUATION_THRESHOLD}"
             )
@@ -121,4 +120,4 @@ def run_evaluation(state: dict):
             except Exception as e:
                 logger.error(f"⚠️ Failed to unload adapter: {e}")
 
-    return is_passed, scores
+    return is_passed

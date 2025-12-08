@@ -66,7 +66,7 @@ async def main():
         # 4. Evaluation Phase
         if settings.ENABLE_EVALUATION and result.get("extracted_data"):
             print("\n🧐 Validating Output Quality...")
-            is_valid, scores = run_evaluation(result)
+            is_valid = run_evaluation(result)
 
             header = (
                 "📢 FINAL EXECUTIVE BRIEF (Verified)"
@@ -81,9 +81,6 @@ async def main():
                 print(final_digest)
             else:
                 print("The generated response did not meet quality standards.")
-                print(
-                    f"Reasons: Relevance={scores.get('answer_relevance',0):.2f}, Faithfulness={scores.get('faithfulness',0):.2f}"
-                )
         else:
             print("\n" + "=" * 60)
             print("📢 FINAL EXECUTIVE BRIEF (Unverified)")

@@ -10,37 +10,29 @@ from config import settings
 
 OUTPUT_DIR = settings.RAGAS_ADAPTER_PATH
 
+# Load tokenizer globally for the formatter
+tokenizer = AutoTokenizer.from_pretrained(settings.LLM_MODEL_ID)
+tokenizer.pad_token = tokenizer.eos_token
+tokenizer.padding_side = "right"
+
 
 def format_instruction(sample):
-    """
-    Formats SQuAD v2 data into a RAGAS-style judge prompt.
-
-    ARCHITECTURAL NOTE:
-    -------------------
-    This training function focuses specifically on 'Context Relevance' (Query <-> Document mapping).
-    Prioritize this over 'Faithfulness' because:
-    1. Relevance is often the harder task for smaller models (requires semantic understanding of the query).
-    2. Irrelevant contexts are the root cause of most hallucinations.
-
-    While this adapter is tuned for Relevance, it helps the model understand the "Judge" persona,
-    which can still have positive transfer effects for other metrics, but it is not
-    explicitly trained on NLI (Entailment) tasks used for Faithfulness.
-
-    TRAINING NOTE:
-    --------------
-    **potential overfitting is being ignored** for this phase.
-    """
     query = sample["question"]
     context = sample["context"]
     is_relevant = len(sample["answers"]["text"]) > 0
     label = "Relevant" if is_relevant else "Irrelevant"
 
-    prompt = (
-        f"<|system|>You are an expert judge evaluating the relevance of a document to a user query. "
-        f"Output 'Relevant' or 'Irrelevant'.<|end|>\n"
-        f"<|user|>Query: {query}\nDocument: {context}<|end|>\n"
-        f"<|assistant|>{label}<|end|>"
-    )
+    messages = [
+        {
+            "role": "system",
+            "content": "You are an expert judge evaluating the relevance of a document to a user query. Output 'Relevant' or 'Irrelevant'.",
+        },
+        {"role": "user", "content": f"Query: {query}\nDocument: {context}"},
+        {"role": "assistant", "content": label},
+    ]
+
+    prompt = tokenizer.apply_chat_template(messages, tokenize=False)
+
     return {"text": prompt}
 
 
@@ -111,10 +103,6 @@ def train():
 
     dynamic_lr = 5e-5 if is_resuming else 2e-4
     print(f"⚙️  Auto-setting Learning Rate to: {dynamic_lr}")
-
-    tokenizer = AutoTokenizer.from_pretrained(settings.LLM_MODEL_ID)
-    tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "right"
 
     training_args = SFTConfig(
         dataset_text_field="text",

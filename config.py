@@ -5,7 +5,7 @@ from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class PromptSettings:
-    """Centralized Prompt Templates."""
+    """Centralized Prompt Templates (Text Only - No Control Tokens)."""
 
     EXTRACTION_SYSTEM: str = (
         "You are an expert Intelligence Analyst. Analyze the provided content "
@@ -14,7 +14,11 @@ class PromptSettings:
         "{format_instructions}"
     )
 
-    REWRITE_TEMPLATE: str = (
+    REWRITE_SYSTEM: str = (
+        "You are a search query optimizer. Your goal is to generate alternative search terms."
+    )
+
+    REWRITE_USER: str = (
         "The user asked for: '{original}'.\n"
         "The previous search '{current}' yielded no relevant intelligence.\n"
         "Generate ONE new, alternative search query that is broader or uses synonyms.\n"
@@ -22,17 +26,15 @@ class PromptSettings:
     )
 
     SUMMARIZE_SYSTEM: str = (
-        "<|system|>\n"
         "You are an executive analyst. Create a high-level briefing based ONLY on the provided intelligence.\n"
         "Focus on answering the Query: '{query}'.\n"
-        "Cite sources where possible.\n"
-        "<|end|>\n"
-        "<|user|>\n"
+        "Cite sources where possible."
+    )
+
+    SUMMARIZE_USER: str = (
         "INTELLIGENCE REPORTS:\n"
         "{context}\n\n"
-        "TASK: Write a structured executive summary.\n"
-        "<|end|>\n"
-        "<|assistant|>"
+        "TASK: Write a structured executive summary."
     )
 
 
@@ -59,9 +61,9 @@ class Settings(BaseSettings):
     CHUNK_SIZE: int = 2000
     CHUNK_OVERLAP: int = 200
     K_RETRIEVAL: int = 15
-    K_FINAL: int = 5
+    K_FINAL: int = 3
     MAX_RETRIES: int = 2
-    MIN_RELEVANCE_SCORE: int = 4
+    MIN_RELEVANCE_SCORE: int = 6
     MAX_INPUT_TOKENS: int = 1500
 
     # --- Telemetry & Eval ---

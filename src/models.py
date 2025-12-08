@@ -1,5 +1,6 @@
 import logging
 from functools import lru_cache
+from typing import Dict, List
 
 import torch
 from langchain_huggingface import HuggingFaceEmbeddings, HuggingFacePipeline
@@ -50,6 +51,13 @@ def get_tokenizer():
     return AutoTokenizer.from_pretrained(settings.LLM_MODEL_ID)
 
 
+def format_chat_prompt(messages: List[Dict[str, str]]) -> str:
+    tokenizer = get_tokenizer()
+    return tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True
+    )
+
+
 @lru_cache(maxsize=1)
 def get_llm() -> HuggingFacePipeline:
     """Singleton accessor for LLM with quantization support."""
@@ -78,17 +86,17 @@ def get_llm() -> HuggingFacePipeline:
             settings.LLM_MODEL_ID, **model_kwargs
         )
 
+        tokenizer = get_tokenizer()
+
         pipe = pipeline(
             "text-generation",
             model=model,
-            tokenizer=get_tokenizer(),
+            tokenizer=tokenizer,
             max_new_tokens=1024,
             temperature=0.1,
             return_full_text=False,
-            # Note: device argument in pipeline can conflict with device_map in model
-            # keeping it None usually lets accelerate handle it
         )
-        return HuggingFacePipeline(pipeline=pipe)
+        return HuggingFacePipeline(pipeline=pipe, batch_size=2)
     except Exception as e:
         logger.error(f"Failed to load LLM: {e}")
         raise

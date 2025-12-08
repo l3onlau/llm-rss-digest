@@ -3,8 +3,7 @@ from functools import partial
 from typing import List, TypedDict
 
 from langchain_core.documents import Document
-from langchain_core.output_parsers import PydanticOutputParser, StrOutputParser
-from langchain_core.prompts import ChatPromptTemplate
+from langchain_core.output_parsers import PydanticOutputParser
 from langgraph.graph import END, StateGraph
 from pydantic import BaseModel, Field
 
@@ -73,11 +72,6 @@ def extract_node(state: AgentState) -> AgentState:
     parser = PydanticOutputParser(pydantic_object=ExtractionResult)
     llm = models.get_llm()
 
-    prompt = ChatPromptTemplate.from_template(
-        settings.prompts.EXTRACTION_SYSTEM
-    ).partial(format_instructions=parser.get_format_instructions())
-
-    chain = prompt | llm | parser
     valid_extracts = []
 
     for doc in state["reranked_docs"]:
@@ -85,9 +79,18 @@ def extract_node(state: AgentState) -> AgentState:
             safe_content = models.truncate_text(
                 doc.page_content, settings.MAX_INPUT_TOKENS
             )
-            res = chain.invoke(
-                {"query": state["original_query"], "content": safe_content}
+
+            system_msg = settings.prompts.EXTRACTION_SYSTEM.format(
+                query=state["original_query"],
+                content=safe_content,
+                format_instructions=parser.get_format_instructions(),
             )
+
+            messages = [{"role": "user", "content": system_msg}]
+            final_prompt = models.format_chat_prompt(messages)
+
+            raw_output = llm.invoke(final_prompt)
+            res = parser.parse(raw_output)
 
             if res.is_relevant and res.relevance_score >= settings.MIN_RELEVANCE_SCORE:
                 source = doc.metadata.get("title", "Unknown Source")
@@ -108,11 +111,20 @@ def extract_node(state: AgentState) -> AgentState:
 
 def rewrite_query_node(state: AgentState) -> AgentState:
     logger.info("🔄 Strategy: Expanding Search Query...")
-    msg = settings.prompts.REWRITE_TEMPLATE.format(
+    llm = models.get_llm()
+
+    user_content = settings.prompts.REWRITE_USER.format(
         original=state["original_query"], current=state["current_query"]
     )
-    llm = models.get_llm()
-    new_query = llm.invoke(msg).strip().replace('"', "")
+
+    messages = [
+        {"role": "system", "content": settings.prompts.REWRITE_SYSTEM},
+        {"role": "user", "content": user_content},
+    ]
+
+    final_prompt = models.format_chat_prompt(messages)
+    new_query = llm.invoke(final_prompt).strip().replace('"', "")
+
     logger.info(f"   -> New Query: {new_query}")
     return {"current_query": new_query, "retry_count": state["retry_count"] + 1}
 
@@ -126,12 +138,16 @@ def summarize_node(state: AgentState) -> AgentState:
     safe_context = models.truncate_text(context, 3000)
     llm = models.get_llm()
 
-    chain = (
-        ChatPromptTemplate.from_template(settings.prompts.SUMMARIZE_SYSTEM)
-        | llm
-        | StrOutputParser()
-    )
-    result = chain.invoke({"context": safe_context, "query": state["original_query"]})
+    system_msg = settings.prompts.SUMMARIZE_SYSTEM.format(query=state["original_query"])
+    user_msg = settings.prompts.SUMMARIZE_USER.format(context=safe_context)
+
+    messages = [
+        {"role": "system", "content": system_msg},
+        {"role": "user", "content": user_msg},
+    ]
+    final_prompt = models.format_chat_prompt(messages)
+
+    result = llm.invoke(final_prompt)
     return {"final_digest": result}
 
 
